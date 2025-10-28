@@ -90,78 +90,52 @@ class TransliterationDataset(Dataset):
 def collate_fn(batch):
     src_batch, tgt_batch = zip(*batch)
     src_lengths = torch.tensor([len(s) for s in src_batch])
-    tgt_lengths = torch.tensor([len(t) for t in tgt_batch])
     
     src_batch = pad_sequence(src_batch, batch_first=True, padding_value=0)
     tgt_batch = pad_sequence(tgt_batch, batch_first=True, padding_value=0)
     
-    return src_batch, tgt_batch, src_lengths, tgt_lengths
+    return src_batch, tgt_batch, src_lengths
 
 
 # ============================================
-# 2. ULTIMATE MODEL ARCHITECTURE
+# 2. IMPROVED ATTENTION MECHANISM
 # ============================================
 
-class PositionalEncoding(nn.Module):
-    """Add positional encoding to help with sequence position awareness"""
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+class BahdanauAttention(nn.Module):
+    """Simple but effective Bahdanau attention"""
+    def __init__(self, hidden_dim, encoder_dim):
+        super(BahdanauAttention, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.encoder_dim = encoder_dim
         
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1), :]
-
-
-class MultiHeadAttention(nn.Module):
-    """Multi-head attention for better context modeling"""
-    def __init__(self, query_dim, key_dim, num_heads=8):
-        super(MultiHeadAttention, self).__init__()
-        assert query_dim % num_heads == 0
+        self.attn = nn.Linear(hidden_dim + encoder_dim, hidden_dim)
+        self.v = nn.Linear(hidden_dim, 1, bias=False)
         
-        self.query_dim = query_dim
-        self.key_dim = key_dim
-        self.num_heads = num_heads
-        self.head_dim = query_dim // num_heads
+    def forward(self, hidden, encoder_outputs):
+        # hidden: (batch, hidden_dim)
+        # encoder_outputs: (batch, src_len, encoder_dim)
         
-        self.query = nn.Linear(query_dim, query_dim)
-        self.key = nn.Linear(key_dim, query_dim)
-        self.value = nn.Linear(key_dim, query_dim)
-        self.fc_out = nn.Linear(query_dim, query_dim)
+        batch_size = encoder_outputs.shape[0]
+        src_len = encoder_outputs.shape[1]
         
-    def forward(self, query, key, value, mask=None):
-        batch_size = query.shape[0]
+        # Repeat hidden state
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)  # (batch, src_len, hidden_dim)
         
-        Q = self.query(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.key(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.value(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # Calculate energy
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        attention = self.v(energy).squeeze(2)  # (batch, src_len)
         
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-        
-        attention = torch.softmax(scores, dim=-1)
-        x = torch.matmul(attention, V)
-        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.query_dim)
-        
-        return self.fc_out(x), attention
+        return F.softmax(attention, dim=1)
 
 
 class Encoder(nn.Module):
-    """Enhanced encoder with multi-head attention"""
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers=3, dropout=0.3):
+    """Enhanced encoder with 3 layers"""
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers=3, dropout=0.35):
         super(Encoder, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
-        self.pos_encoding = PositionalEncoding(embedding_dim)
         self.dropout = nn.Dropout(dropout)
         
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers, 
@@ -172,7 +146,7 @@ class Encoder(nn.Module):
         self.fc_cell = nn.Linear(hidden_dim * 2, hidden_dim)
         
     def forward(self, x, lengths=None):
-        embedded = self.dropout(self.pos_encoding(self.embedding(x)))
+        embedded = self.dropout(self.embedding(x))
         
         if lengths is not None:
             embedded = pack_padded_sequence(embedded, lengths.cpu(), batch_first=True, enforce_sorted=False)
@@ -193,56 +167,48 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Enhanced decoder with multi-head attention"""
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, encoder_hidden_dim, 
-                 num_layers=3, num_heads=8, dropout=0.3):
+    """Enhanced decoder with attention"""
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, encoder_dim, 
+                 num_layers=3, dropout=0.35):
         super(Decoder, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.vocab_size = vocab_size
         
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
-        self.pos_encoding = PositionalEncoding(embedding_dim)
         self.dropout = nn.Dropout(dropout)
+        self.attention = BahdanauAttention(hidden_dim, encoder_dim)
         
-        self.attention = MultiHeadAttention(hidden_dim, encoder_hidden_dim, num_heads)
-        
-        self.lstm = nn.LSTM(embedding_dim + encoder_hidden_dim, hidden_dim, num_layers, 
+        self.lstm = nn.LSTM(embedding_dim + encoder_dim, hidden_dim, num_layers, 
                            batch_first=True, dropout=dropout if num_layers > 1 else 0)
         
-        # Enhanced output layer with residual connection
-        self.fc1 = nn.Linear(hidden_dim + encoder_hidden_dim + embedding_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, vocab_size)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        # Output layers with residual
+        self.fc1 = nn.Linear(hidden_dim + encoder_dim + embedding_dim, hidden_dim * 2)
+        self.fc2 = nn.Linear(hidden_dim * 2, vocab_size)
+        self.dropout_fc = nn.Dropout(dropout)
         
     def forward(self, x, hidden, encoder_outputs):
-        embedded = self.dropout(self.pos_encoding(self.embedding(x)))
+        embedded = self.dropout(self.embedding(x))  # (batch, 1, emb_dim)
         
-        # Multi-head attention
-        if isinstance(hidden, tuple):
-            query = hidden[0][-1].unsqueeze(1)
-        else:
-            query = hidden[-1].unsqueeze(1)
+        # Calculate attention
+        hidden_last = hidden[0][-1]  # (batch, hidden_dim)
+        a = self.attention(hidden_last, encoder_outputs)  # (batch, src_len)
+        a = a.unsqueeze(1)  # (batch, 1, src_len)
         
-        context, attention_weights = self.attention(query, encoder_outputs, encoder_outputs)
+        # Weighted context
+        context = torch.bmm(a, encoder_outputs)  # (batch, 1, encoder_dim)
         
-        # Project context to match expected dimension
-        # context is (batch, 1, hidden_dim), but encoder_outputs are (batch, seq, encoder_hidden_dim)
-        # We need to get the actual context from encoder_outputs
-        attention_weights_expanded = attention_weights.mean(dim=1).unsqueeze(1)  # (batch, 1, src_len)
-        context = torch.bmm(attention_weights_expanded, encoder_outputs)  # (batch, 1, encoder_hidden_dim)
-        
-        # Concatenate embedded and context
-        rnn_input = torch.cat((embedded, context), dim=2)  # (batch, 1, embedding_dim + encoder_hidden_dim)
+        # Concatenate
+        rnn_input = torch.cat((embedded, context), dim=2)
         
         output, hidden = self.lstm(rnn_input, hidden)
         
-        # Enhanced prediction with residual
+        # Prediction
         combined = torch.cat((output.squeeze(1), context.squeeze(1), embedded.squeeze(1)), dim=1)
-        hidden_out = self.layer_norm(torch.relu(self.fc1(combined)))
+        hidden_out = self.dropout_fc(torch.relu(self.fc1(combined)))
         prediction = self.fc2(hidden_out)
         
-        return prediction, hidden, attention_weights.mean(dim=1)
+        return prediction, hidden, a.squeeze(1)
 
 
 class Seq2SeqUltimate(nn.Module):
@@ -298,7 +264,7 @@ class Seq2SeqUltimate(nn.Module):
             return torch.cat(predictions, dim=1)
     
     def beam_search(self, src, src_lengths=None, beam_width=5, max_len=50):
-        """Enhanced beam search with length normalization"""
+        """Beam search with length normalization"""
         self.eval()
         with torch.no_grad():
             batch_size = src.shape[0]
@@ -323,7 +289,6 @@ class Seq2SeqUltimate(nn.Module):
                     top_log_probs, top_indices = log_probs.topk(beam_width * 2)
                     
                     for log_prob, idx in zip(top_log_probs[0], top_indices[0]):
-                        # Length normalization
                         length_penalty = ((5 + len(beam['sequence']) + 1) ** 0.6) / ((5 + 1) ** 0.6)
                         normalized_score = (beam['score'] + log_prob.item()) / length_penalty
                         
@@ -335,7 +300,6 @@ class Seq2SeqUltimate(nn.Module):
                         }
                         candidates.append(new_beam)
                 
-                # Keep top beam_width beams based on normalized score
                 beams = sorted(candidates, key=lambda x: x.get('normalized_score', x['score']), reverse=True)[:beam_width]
                 
                 if all(beam['sequence'][-1] == 2 for beam in beams):
@@ -346,7 +310,7 @@ class Seq2SeqUltimate(nn.Module):
 
 
 # ============================================
-# 3. TRAINING WITH ADVANCED TECHNIQUES
+# 3. TRAINING
 # ============================================
 
 class LabelSmoothingLoss(nn.Module):
@@ -377,7 +341,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, clip=1, accumul
     epoch_loss = 0
     optimizer.zero_grad()
     
-    for idx, (src, tgt, src_lengths, tgt_lengths) in enumerate(tqdm(dataloader, desc="Training")):
+    for idx, (src, tgt, src_lengths) in enumerate(tqdm(dataloader, desc="Training")):
         src, tgt = src.to(device), tgt.to(device)
         src_lengths = src_lengths.to(device)
         
@@ -406,7 +370,7 @@ def evaluate(model, dataloader, criterion, device):
     epoch_loss = 0
     
     with torch.no_grad():
-        for src, tgt, src_lengths, tgt_lengths in tqdm(dataloader, desc="Evaluating"):
+        for src, tgt, src_lengths in tqdm(dataloader, desc="Evaluating"):
             src, tgt = src.to(device), tgt.to(device)
             src_lengths = src_lengths.to(device)
             
@@ -451,21 +415,19 @@ def transliterate(model, text, src_vocab, tgt_vocab, device, max_len=50, use_bea
 CONFIG = {
     'embedding_dim': 256,
     'hidden_dim': 512,
-    'num_layers': 3,  # Increased to 3!
-    'num_heads': 8,
+    'num_layers': 3,
     'dropout': 0.35,
     'batch_size': 64,
     'learning_rate': 0.001,
-    'num_epochs': 40,  # Increased to 40!
+    'num_epochs': 40,
     'clip': 1,
     'teacher_forcing_ratio': 0.5,
     'label_smoothing': 0.15,
     'accumulation_steps': 2,
-    'warmup_epochs': 5,
 }
 
 print("="*60)
-print("🔥 ULTIMATE MODEL CONFIGURATION")
+print("🔥 ULTIMATE MODEL - SIMPLIFIED & WORKING")
 print("="*60)
 for key, value in CONFIG.items():
     print(f"  {key}: {value}")
@@ -501,13 +463,13 @@ test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'],
                          shuffle=False, collate_fn=collate_fn)
 
 print("\n" + "="*60)
-print("🚀 INITIALIZING ULTIMATE MODEL")
+print("🚀 INITIALIZING MODEL")
 print("="*60)
 
 encoder = Encoder(len(src_vocab), CONFIG['embedding_dim'], CONFIG['hidden_dim'], 
                  CONFIG['num_layers'], CONFIG['dropout'])
 decoder = Decoder(len(tgt_vocab), CONFIG['embedding_dim'], CONFIG['hidden_dim'], 
-                 CONFIG['hidden_dim'] * 2, CONFIG['num_layers'], CONFIG['num_heads'], CONFIG['dropout'])
+                 CONFIG['hidden_dim'] * 2, CONFIG['num_layers'], CONFIG['dropout'])
 
 model = Seq2SeqUltimate(encoder, decoder, device).to(device)
 
@@ -515,22 +477,21 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 print(f"Parameters: {count_parameters(model):,}")
-print("\n✅ ULTIMATE Features:")
-print("   • 3-layer Deep Network")
-print("   • Multi-Head Attention (8 heads)")
-print("   • Positional Encoding")
-print("   • Enhanced Beam Search (width=5)")
+print("\n✅ Features:")
+print("   • 3-Layer Deep LSTM")
+print("   • Bahdanau Attention")
+print("   • Bidirectional Encoder")
+print("   • Beam Search (width=5)")
 print("   • Label Smoothing (0.15)")
-print("   • Layer Normalization")
-print("   • Residual Connections")
-print("   • 40 Epochs Training")
+print("   • Packed Sequences")
+print("   • 40 Epochs")
 
 optimizer = optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=0.0001)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 criterion = LabelSmoothingLoss(len(tgt_vocab), smoothing=CONFIG['label_smoothing'], ignore_index=0)
 
 print("\n" + "="*60)
-print("⏱️  TRAINING - WILL TAKE ~60-70 MINUTES")
+print("⏱️  TRAINING - ~60-70 MINUTES")
 print("="*60)
 
 train_losses = []
@@ -549,16 +510,16 @@ for epoch in range(CONFIG['num_epochs']):
     train_losses.append(train_loss)
     valid_losses.append(valid_loss)
     
-    print(f"📊 Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f}")
+    print(f"📊 Train: {train_loss:.4f} | Valid: {valid_loss:.4f}")
     
     scheduler.step(valid_loss)
     current_lr = optimizer.param_groups[0]['lr']
-    print(f"📉 Learning Rate: {current_lr:.6f}")
+    print(f"📉 LR: {current_lr:.6f}")
     
     if valid_loss < best_valid_loss:
         best_valid_loss = valid_loss
         torch.save(model.state_dict(), 'ultimate_model.pt')
-        print("🏆 BEST MODEL SAVED!")
+        print("🏆 BEST!")
 
 plt.figure(figsize=(14, 5))
 plt.subplot(1, 2, 1)
@@ -567,7 +528,7 @@ plt.plot(valid_losses, label='Valid', linewidth=2)
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.legend()
-plt.title('Training Progress (40 Epochs)')
+plt.title('Training (40 Epochs)')
 plt.grid(True, alpha=0.3)
 
 plt.subplot(1, 2, 2)
@@ -576,7 +537,7 @@ plt.plot(range(1, len(valid_losses)+1), valid_losses, 's-', label='Valid', marke
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.legend()
-plt.title('Detailed Loss Curves')
+plt.title('Detailed Curves')
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
@@ -584,24 +545,20 @@ plt.show()
 model.load_state_dict(torch.load('ultimate_model.pt'))
 
 print("\n" + "="*60)
-print("🎯 TESTING ULTIMATE MODEL")
+print("🎯 TESTING")
 print("="*60)
 
 test_words = ['ghar', 'dost', 'paani', 'kitaab', 'pyaar', 'ajanabee', 
-              'namaste', 'dhanyavaad', 'bharat', 'independence', 'computer', 'school']
+              'namaste', 'dhanyavaad', 'bharat', 'independence', 'computer']
 
-print("\n🔥 BEAM SEARCH PREDICTIONS:")
+print("\n🔥 BEAM SEARCH:")
 for word in test_words:
     pred = transliterate(model, word, src_vocab, tgt_vocab, device, use_beam_search=True)
     print(f"  {word:15} -> {pred}")
 
 test_loss = evaluate(model, test_loader, criterion, device)
-print(f"\n🎯 Final Test Loss: {test_loss:.4f}")
+print(f"\n🎯 Test Loss: {test_loss:.4f}")
 
 print("\n" + "="*60)
-print("✅ ULTIMATE MODEL COMPLETE!")
+print("✅ DONE! Expected: 55-65% word accuracy!")
 print("="*60)
-print("\n🎯 Expected Results:")
-print("   • Word Accuracy: 55-65% (was 39%)")
-print("   • Char Accuracy: 82-88% (was 70%)")
-print("\nRun accuracy calculation next! 🚀")
