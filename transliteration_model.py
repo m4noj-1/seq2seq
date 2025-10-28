@@ -120,18 +120,19 @@ class PositionalEncoding(nn.Module):
 
 class MultiHeadAttention(nn.Module):
     """Multi-head attention for better context modeling"""
-    def __init__(self, hidden_dim, num_heads=8):
+    def __init__(self, query_dim, key_dim, num_heads=8):
         super(MultiHeadAttention, self).__init__()
-        assert hidden_dim % num_heads == 0
+        assert query_dim % num_heads == 0
         
-        self.hidden_dim = hidden_dim
+        self.query_dim = query_dim
+        self.key_dim = key_dim
         self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
+        self.head_dim = query_dim // num_heads
         
-        self.query = nn.Linear(hidden_dim, hidden_dim)
-        self.key = nn.Linear(hidden_dim, hidden_dim)
-        self.value = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_out = nn.Linear(hidden_dim, hidden_dim)
+        self.query = nn.Linear(query_dim, query_dim)
+        self.key = nn.Linear(key_dim, query_dim)
+        self.value = nn.Linear(key_dim, query_dim)
+        self.fc_out = nn.Linear(query_dim, query_dim)
         
     def forward(self, query, key, value, mask=None):
         batch_size = query.shape[0]
@@ -147,7 +148,7 @@ class MultiHeadAttention(nn.Module):
         
         attention = torch.softmax(scores, dim=-1)
         x = torch.matmul(attention, V)
-        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.hidden_dim)
+        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.query_dim)
         
         return self.fc_out(x), attention
 
@@ -204,7 +205,7 @@ class Decoder(nn.Module):
         self.pos_encoding = PositionalEncoding(embedding_dim)
         self.dropout = nn.Dropout(dropout)
         
-        self.attention = MultiHeadAttention(hidden_dim, num_heads)
+        self.attention = MultiHeadAttention(hidden_dim, encoder_hidden_dim, num_heads)
         
         self.lstm = nn.LSTM(embedding_dim + encoder_hidden_dim, hidden_dim, num_layers, 
                            batch_first=True, dropout=dropout if num_layers > 1 else 0)
@@ -225,8 +226,14 @@ class Decoder(nn.Module):
         
         context, attention_weights = self.attention(query, encoder_outputs, encoder_outputs)
         
+        # Project context to match expected dimension
+        # context is (batch, 1, hidden_dim), but encoder_outputs are (batch, seq, encoder_hidden_dim)
+        # We need to get the actual context from encoder_outputs
+        attention_weights_expanded = attention_weights.mean(dim=1).unsqueeze(1)  # (batch, 1, src_len)
+        context = torch.bmm(attention_weights_expanded, encoder_outputs)  # (batch, 1, encoder_hidden_dim)
+        
         # Concatenate embedded and context
-        rnn_input = torch.cat((embedded, context), dim=2)
+        rnn_input = torch.cat((embedded, context), dim=2)  # (batch, 1, embedding_dim + encoder_hidden_dim)
         
         output, hidden = self.lstm(rnn_input, hidden)
         
@@ -235,7 +242,7 @@ class Decoder(nn.Module):
         hidden_out = self.layer_norm(torch.relu(self.fc1(combined)))
         prediction = self.fc2(hidden_out)
         
-        return prediction, hidden, attention_weights
+        return prediction, hidden, attention_weights.mean(dim=1)
 
 
 class Seq2SeqUltimate(nn.Module):
