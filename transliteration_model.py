@@ -487,7 +487,7 @@ print("   • Higher Capacity (512 hidden units)")
 # Initialize optimizer and loss with learning rate scheduler
 optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
-                                                  factor=0.5, patience=2, verbose=True)
+                                                  factor=0.5, patience=2)
 criterion = nn.CrossEntropyLoss(ignore_index=0)
 
 # Training loop
@@ -580,3 +580,4 @@ print("\n🎯 Expected Improvement: 45-65% word accuracy (was ~29%)")
 print("\n" + "="*60)
 print("DONE! Improved model trained and saved.")
 print("="*60)
+
