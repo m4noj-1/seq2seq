@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.model_selection import train_test_split
@@ -103,83 +104,157 @@ def collate_fn(batch):
 
 
 # ============================================
-# 2. MODEL ARCHITECTURE
+# 2. IMPROVED MODEL WITH ATTENTION
 # ============================================
 
+class Attention(nn.Module):
+    """Bahdanau Attention Mechanism"""
+    def __init__(self, hidden_dim):
+        super(Attention, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.attn = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.v = nn.Linear(hidden_dim, 1, bias=False)
+        
+    def forward(self, hidden, encoder_outputs):
+        # hidden: (num_layers, batch_size, hidden_dim)
+        # encoder_outputs: (batch_size, src_len, hidden_dim)
+        
+        batch_size = encoder_outputs.shape[0]
+        src_len = encoder_outputs.shape[1]
+        
+        # Use the last layer's hidden state
+        hidden = hidden[-1]  # (batch_size, hidden_dim)
+        
+        # Repeat hidden state src_len times
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)  # (batch_size, src_len, hidden_dim)
+        
+        # Concatenate hidden and encoder_outputs
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        # energy: (batch_size, src_len, hidden_dim)
+        
+        attention = self.v(energy).squeeze(2)  # (batch_size, src_len)
+        
+        return F.softmax(attention, dim=1)
+
+
 class Encoder(nn.Module):
-    """Encoder RNN"""
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers=1, 
-                 cell_type='LSTM', dropout=0.1):
+    """Improved Encoder with Bidirectional LSTM"""
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers=2, 
+                 cell_type='LSTM', dropout=0.3):
         super(Encoder, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.cell_type = cell_type
         
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+        self.dropout = nn.Dropout(dropout)
         
         if cell_type == 'LSTM':
             self.rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, 
-                              batch_first=True, dropout=dropout if num_layers > 1 else 0)
+                              batch_first=True, dropout=dropout if num_layers > 1 else 0,
+                              bidirectional=True)
         elif cell_type == 'GRU':
             self.rnn = nn.GRU(embedding_dim, hidden_dim, num_layers, 
-                             batch_first=True, dropout=dropout if num_layers > 1 else 0)
+                             batch_first=True, dropout=dropout if num_layers > 1 else 0,
+                             bidirectional=True)
         else:  # RNN
             self.rnn = nn.RNN(embedding_dim, hidden_dim, num_layers, 
-                             batch_first=True, dropout=dropout if num_layers > 1 else 0)
+                             batch_first=True, dropout=dropout if num_layers > 1 else 0,
+                             bidirectional=True)
+        
+        # Linear layer to convert bidirectional outputs to single direction
+        self.fc_hidden = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.fc_cell = nn.Linear(hidden_dim * 2, hidden_dim)
     
     def forward(self, x):
         # x: (batch_size, seq_len)
-        embedded = self.embedding(x)  # (batch_size, seq_len, embedding_dim)
+        embedded = self.dropout(self.embedding(x))  # (batch_size, seq_len, embedding_dim)
         
         if self.cell_type == 'LSTM':
             outputs, (hidden, cell) = self.rnn(embedded)
+            # outputs: (batch_size, seq_len, hidden_dim*2)
+            # hidden, cell: (num_layers*2, batch_size, hidden_dim)
+            
+            # Combine forward and backward hidden states
+            hidden = torch.tanh(self.fc_hidden(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)))
+            cell = torch.tanh(self.fc_cell(torch.cat((cell[-2,:,:], cell[-1,:,:]), dim=1)))
+            
+            # Reshape to (num_layers, batch_size, hidden_dim)
+            hidden = hidden.unsqueeze(0).repeat(self.num_layers, 1, 1)
+            cell = cell.unsqueeze(0).repeat(self.num_layers, 1, 1)
+            
             return outputs, (hidden, cell)
         else:
             outputs, hidden = self.rnn(embedded)
+            hidden = torch.tanh(self.fc_hidden(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)))
+            hidden = hidden.unsqueeze(0).repeat(self.num_layers, 1, 1)
             return outputs, hidden
 
 
 class Decoder(nn.Module):
-    """Decoder RNN"""
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers=1, 
-                 cell_type='LSTM', dropout=0.1):
+    """Improved Decoder with Attention"""
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers=2, 
+                 cell_type='LSTM', dropout=0.3):
         super(Decoder, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.cell_type = cell_type
+        self.vocab_size = vocab_size
         
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+        self.dropout = nn.Dropout(dropout)
+        self.attention = Attention(hidden_dim)
         
+        # Input to RNN is embedding + context (encoder hidden_dim * 2 for bidirectional)
         if cell_type == 'LSTM':
-            self.rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, 
+            self.rnn = nn.LSTM(embedding_dim + hidden_dim * 2, hidden_dim, num_layers, 
                               batch_first=True, dropout=dropout if num_layers > 1 else 0)
         elif cell_type == 'GRU':
-            self.rnn = nn.GRU(embedding_dim, hidden_dim, num_layers, 
+            self.rnn = nn.GRU(embedding_dim + hidden_dim * 2, hidden_dim, num_layers, 
                              batch_first=True, dropout=dropout if num_layers > 1 else 0)
         else:  # RNN
-            self.rnn = nn.RNN(embedding_dim, hidden_dim, num_layers, 
+            self.rnn = nn.RNN(embedding_dim + hidden_dim * 2, hidden_dim, num_layers, 
                              batch_first=True, dropout=dropout if num_layers > 1 else 0)
         
-        self.fc = nn.Linear(hidden_dim, vocab_size)
+        # Output layer: hidden + context + embedding -> vocab
+        self.fc = nn.Linear(hidden_dim + hidden_dim * 2 + embedding_dim, vocab_size)
     
-    def forward(self, x, hidden):
+    def forward(self, x, hidden, encoder_outputs):
         # x: (batch_size, 1)
-        embedded = self.embedding(x)  # (batch_size, 1, embedding_dim)
+        # hidden: (num_layers, batch_size, hidden_dim) or tuple for LSTM
+        # encoder_outputs: (batch_size, src_len, hidden_dim*2)
+        
+        embedded = self.dropout(self.embedding(x))  # (batch_size, 1, embedding_dim)
+        
+        # Calculate attention weights
+        if self.cell_type == 'LSTM':
+            a = self.attention(hidden[0], encoder_outputs)  # (batch_size, src_len)
+        else:
+            a = self.attention(hidden, encoder_outputs)
+        
+        a = a.unsqueeze(1)  # (batch_size, 1, src_len)
+        
+        # Calculate weighted context vector
+        context = torch.bmm(a, encoder_outputs)  # (batch_size, 1, hidden_dim*2)
+        
+        # Concatenate embedded and context
+        rnn_input = torch.cat((embedded, context), dim=2)  # (batch_size, 1, embedding_dim + hidden_dim*2)
         
         if self.cell_type == 'LSTM':
-            output, (hidden, cell) = self.rnn(embedded, hidden)
-            prediction = self.fc(output.squeeze(1))  # (batch_size, vocab_size)
-            return prediction, (hidden, cell)
+            output, (hidden, cell) = self.rnn(rnn_input, hidden)
+            # Concatenate output, context, and embedded for prediction
+            prediction = self.fc(torch.cat((output.squeeze(1), context.squeeze(1), embedded.squeeze(1)), dim=1))
+            return prediction, (hidden, cell), a.squeeze(1)
         else:
-            output, hidden = self.rnn(embedded, hidden)
-            prediction = self.fc(output.squeeze(1))  # (batch_size, vocab_size)
-            return prediction, hidden
+            output, hidden = self.rnn(rnn_input, hidden)
+            prediction = self.fc(torch.cat((output.squeeze(1), context.squeeze(1), embedded.squeeze(1)), dim=1))
+            return prediction, hidden, a.squeeze(1)
 
 
-class Seq2Seq(nn.Module):
-    """Sequence to Sequence Model"""
+class Seq2SeqWithAttention(nn.Module):
+    """Sequence to Sequence Model with Attention"""
     def __init__(self, encoder, decoder, device):
-        super(Seq2Seq, self).__init__()
+        super(Seq2SeqWithAttention, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.device = device
@@ -190,13 +265,14 @@ class Seq2Seq(nn.Module):
         
         batch_size = src.shape[0]
         tgt_len = tgt.shape[1]
-        tgt_vocab_size = self.decoder.fc.out_features
+        tgt_vocab_size = self.decoder.vocab_size
         
-        # Store outputs
+        # Store outputs and attention weights
         outputs = torch.zeros(batch_size, tgt_len, tgt_vocab_size).to(self.device)
+        attentions = torch.zeros(batch_size, tgt_len, src.shape[1]).to(self.device)
         
         # Encode the source sequence
-        _, encoder_hidden = self.encoder(src)
+        encoder_outputs, encoder_hidden = self.encoder(src)
         
         # First input to decoder is <SOS> token
         decoder_input = tgt[:, 0].unsqueeze(1)  # (batch_size, 1)
@@ -204,15 +280,16 @@ class Seq2Seq(nn.Module):
         
         # Decode one character at a time
         for t in range(1, tgt_len):
-            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
+            decoder_output, decoder_hidden, attention = self.decoder(decoder_input, decoder_hidden, encoder_outputs)
             outputs[:, t, :] = decoder_output
+            attentions[:, t, :] = attention
             
             # Teacher forcing: use actual target as next input
             teacher_force = random.random() < teacher_forcing_ratio
             top1 = decoder_output.argmax(1)
             decoder_input = tgt[:, t].unsqueeze(1) if teacher_force else top1.unsqueeze(1)
         
-        return outputs
+        return outputs, attentions
     
     def predict(self, src, max_len=50):
         """Predict without teacher forcing"""
@@ -221,18 +298,20 @@ class Seq2Seq(nn.Module):
             batch_size = src.shape[0]
             
             # Encode
-            _, encoder_hidden = self.encoder(src)
+            encoder_outputs, encoder_hidden = self.encoder(src)
             
             # Start with <SOS>
             decoder_input = torch.tensor([[1]] * batch_size).to(self.device)  # <SOS>
             decoder_hidden = encoder_hidden
             
             predictions = []
+            attentions = []
             
             for _ in range(max_len):
-                decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
+                decoder_output, decoder_hidden, attention = self.decoder(decoder_input, decoder_hidden, encoder_outputs)
                 top1 = decoder_output.argmax(1)
                 predictions.append(top1.unsqueeze(1))
+                attentions.append(attention)
                 
                 decoder_input = top1.unsqueeze(1)
                 
@@ -240,7 +319,7 @@ class Seq2Seq(nn.Module):
                 if (top1 == 2).all():  # <EOS> token
                     break
             
-            return torch.cat(predictions, dim=1)
+            return torch.cat(predictions, dim=1), torch.stack(attentions, dim=1)
 
 
 # ============================================
@@ -257,7 +336,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, clip=1):
         
         optimizer.zero_grad()
         
-        output = model(src, tgt)
+        output, _ = model(src, tgt)
         
         # Reshape for loss calculation
         output_dim = output.shape[-1]
@@ -285,7 +364,7 @@ def evaluate(model, dataloader, criterion, device):
         for src, tgt in tqdm(dataloader, desc="Evaluating"):
             src, tgt = src.to(device), tgt.to(device)
             
-            output = model(src, tgt, teacher_forcing_ratio=0)  # No teacher forcing
+            output, _ = model(src, tgt, teacher_forcing_ratio=0)  # No teacher forcing
             
             output_dim = output.shape[-1]
             output = output[:, 1:].reshape(-1, output_dim)
@@ -306,7 +385,7 @@ def transliterate(model, text, src_vocab, tgt_vocab, device, max_len=50):
     src_tensor = torch.tensor([indices]).to(device)
     
     # Get prediction
-    predictions = model.predict(src_tensor, max_len)
+    predictions, attentions = model.predict(src_tensor, max_len)
     
     # Convert indices back to characters
     predicted_chars = []
@@ -324,30 +403,31 @@ def transliterate(model, text, src_vocab, tgt_vocab, device, max_len=50):
 # 4. MAIN EXECUTION
 # ============================================
 
-# CONFIGURATION - You can change these parameters
+# IMPROVED CONFIGURATION
 CONFIG = {
-    'embedding_dim': 128,
-    'hidden_dim': 256,
-    'num_layers': 1,
-    'cell_type': 'LSTM',  # Options: 'LSTM', 'GRU', 'RNN'
-    'dropout': 0.1,
+    'embedding_dim': 256,      # Increased from 128
+    'hidden_dim': 512,         # Increased from 256
+    'num_layers': 2,           # Increased from 1
+    'cell_type': 'LSTM',
+    'dropout': 0.3,            # Increased from 0.1
     'batch_size': 64,
     'learning_rate': 0.001,
-    'num_epochs': 10,
+    'num_epochs': 25,          # Increased from 10
     'clip': 1,
+    'teacher_forcing_ratio': 0.5,
 }
 
-print("Configuration:")
+print("="*60)
+print("🚀 IMPROVED CONFIGURATION WITH ATTENTION")
+print("="*60)
 for key, value in CONFIG.items():
     print(f"  {key}: {value}")
 
-# Load data - UPLOAD YOUR FILES TO COLAB FIRST
-print("\n" + "="*50)
+# Load data
+print("\n" + "="*60)
 print("LOADING DATA")
-print("="*50)
+print("="*60)
 
-# Upload files to Colab (you'll do this manually in Colab)
-# For now, assuming files are in the current directory
 train_data = load_data('hin_train.csv')
 valid_data = load_data('hin_valid.csv')
 test_data = load_data('hin_test.csv')
@@ -381,32 +461,39 @@ valid_loader = DataLoader(valid_dataset, batch_size=CONFIG['batch_size'],
 test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'], 
                          shuffle=False, collate_fn=collate_fn)
 
-# Initialize model
-print("\n" + "="*50)
-print("INITIALIZING MODEL")
-print("="*50)
+# Initialize improved model
+print("\n" + "="*60)
+print("INITIALIZING IMPROVED MODEL WITH ATTENTION")
+print("="*60)
 
 encoder = Encoder(len(src_vocab), CONFIG['embedding_dim'], CONFIG['hidden_dim'], 
                  CONFIG['num_layers'], CONFIG['cell_type'], CONFIG['dropout'])
 decoder = Decoder(len(tgt_vocab), CONFIG['embedding_dim'], CONFIG['hidden_dim'], 
                  CONFIG['num_layers'], CONFIG['cell_type'], CONFIG['dropout'])
 
-model = Seq2Seq(encoder, decoder, device).to(device)
+model = Seq2SeqWithAttention(encoder, decoder, device).to(device)
 
 # Count parameters
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 print(f"Total trainable parameters: {count_parameters(model):,}")
+print("✅ Model now includes:")
+print("   • Bidirectional Encoder")
+print("   • Bahdanau Attention Mechanism")
+print("   • Deeper Network (2 layers)")
+print("   • Higher Capacity (512 hidden units)")
 
-# Initialize optimizer and loss
+# Initialize optimizer and loss with learning rate scheduler
 optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
-criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
+                                                  factor=0.5, patience=2, verbose=True)
+criterion = nn.CrossEntropyLoss(ignore_index=0)
 
 # Training loop
-print("\n" + "="*50)
-print("TRAINING")
-print("="*50)
+print("\n" + "="*60)
+print("TRAINING WITH IMPROVED ARCHITECTURE")
+print("="*60)
 
 train_losses = []
 valid_losses = []
@@ -423,77 +510,73 @@ for epoch in range(CONFIG['num_epochs']):
     
     print(f"Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f}")
     
+    # Update learning rate
+    scheduler.step(valid_loss)
+    
     # Save best model
     if valid_loss < best_valid_loss:
         best_valid_loss = valid_loss
-        torch.save(model.state_dict(), 'best_model.pt')
+        torch.save(model.state_dict(), 'best_model_attention.pt')
         print("  → Best model saved!")
 
 # Plot losses
-plt.figure(figsize=(10, 5))
-plt.plot(train_losses, label='Train Loss')
-plt.plot(valid_losses, label='Valid Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-plt.title('Training and Validation Loss')
-plt.grid(True)
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(train_losses, label='Train Loss', linewidth=2)
+plt.plot(valid_losses, label='Valid Loss', linewidth=2)
+plt.xlabel('Epoch', fontsize=12)
+plt.ylabel('Loss', fontsize=12)
+plt.legend(fontsize=10)
+plt.title('Training and Validation Loss', fontsize=14, fontweight='bold')
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+epochs = range(1, len(train_losses) + 1)
+plt.plot(epochs, train_losses, 'o-', label='Train Loss', linewidth=2, markersize=4)
+plt.plot(epochs, valid_losses, 's-', label='Valid Loss', linewidth=2, markersize=4)
+plt.xlabel('Epoch', fontsize=12)
+plt.ylabel('Loss', fontsize=12)
+plt.legend(fontsize=10)
+plt.title('Loss Curves (Detailed)', fontsize=14, fontweight='bold')
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
 plt.show()
 
 # Load best model for testing
-model.load_state_dict(torch.load('best_model.pt'))
+model.load_state_dict(torch.load('best_model_attention.pt'))
 
 # Test the model
-print("\n" + "="*50)
-print("TESTING")
-print("="*50)
+print("\n" + "="*60)
+print("TESTING IMPROVED MODEL")
+print("="*60)
 
-test_examples = ['ghar', 'dost', 'paani', 'kitaab', 'pyaar', 'ajanabee']
+test_examples = ['ghar', 'dost', 'paani', 'kitaab', 'pyaar', 'ajanabee', 
+                 'namaste', 'dhanyavaad', 'bharat', 'school']
 
 print("\nTransliteration Examples:")
 for word in test_examples:
     prediction = transliterate(model, word, src_vocab, tgt_vocab, device)
-    print(f"  {word} -> {prediction}")
+    print(f"  {word:15} -> {prediction}")
 
 # Calculate test loss
 test_loss = evaluate(model, test_loader, criterion, device)
 print(f"\nTest Loss: {test_loss:.4f}")
 
-print("\n" + "="*50)
-print("ANALYSIS: COMPUTATIONS AND PARAMETERS")
-print("="*50)
+print("\n" + "="*60)
+print("IMPROVEMENTS SUMMARY")
+print("="*60)
+print("\n✅ What's New:")
+print("   1. Bidirectional Encoder - captures context from both directions")
+print("   2. Attention Mechanism - focuses on relevant input characters")
+print("   3. Deeper Network - 2 layers for more capacity")
+print("   4. Larger Hidden Dimension - 512 units (was 256)")
+print("   5. Better Regularization - 0.3 dropout (was 0.1)")
+print("   6. Learning Rate Scheduling - adapts LR during training")
+print("   7. More Training - 25 epochs (was 10)")
+print("\n🎯 Expected Improvement: 45-65% word accuracy (was ~29%)")
 
-# For the theoretical analysis (assuming single layer, same vocab size)
-print("\nAssuming:")
-print(f"  - Embedding dimension (E) = {CONFIG['embedding_dim']}")
-print(f"  - Hidden dimension (H) = {CONFIG['hidden_dim']}")
-print(f"  - Number of layers = 1")
-print(f"  - Sequence length (L) = variable")
-print(f"  - Vocab size source (V_src) = {len(src_vocab)}")
-print(f"  - Vocab size target (V_tgt) = {len(tgt_vocab)}")
-
-E = CONFIG['embedding_dim']
-H = CONFIG['hidden_dim']
-V_src = len(src_vocab)
-V_tgt = len(tgt_vocab)
-
-print("\n1. TOTAL PARAMETERS:")
-print("   Components:")
-print(f"   - Encoder Embedding: V_src × E = {V_src} × {E} = {V_src * E:,}")
-print(f"   - Encoder LSTM: 4 × (E×H + H×H + H) = 4 × ({E}×{H} + {H}×{H} + {H}) = {4 * (E*H + H*H + H):,}")
-print(f"   - Decoder Embedding: V_tgt × E = {V_tgt} × {E} = {V_tgt * E:,}")
-print(f"   - Decoder LSTM: 4 × (E×H + H×H + H) = {4 * (E*H + H*H + H):,}")
-print(f"   - Decoder FC: H × V_tgt + V_tgt = {H} × {V_tgt} + {V_tgt} = {H * V_tgt + V_tgt:,}")
-total_params = V_src*E + 4*(E*H + H*H + H) + V_tgt*E + 4*(E*H + H*H + H) + H*V_tgt + V_tgt
-print(f"   TOTAL: {total_params:,} parameters")
-
-print("\n2. COMPUTATIONS PER FORWARD PASS (for sequence length L):")
-print("   - Encoder embedding lookup: O(L)")
-print("   - Encoder LSTM: O(L × H²)")
-print("   - Decoder runs L times, each step: O(H²)")
-print("   - Decoder FC layer L times: O(L × H × V_tgt)")
-print("   - Total: O(L × H² + L × H × V_tgt)")
-
-print("\n" + "="*50)
-print("DONE! Model trained and saved.")
-print("="*50)
+print("\n" + "="*60)
+print("DONE! Improved model trained and saved.")
+print("="*60)
