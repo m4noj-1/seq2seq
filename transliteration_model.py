@@ -109,11 +109,12 @@ def collate_fn(batch):
 
 class Attention(nn.Module):
     """Bahdanau Attention Mechanism"""
-    def __init__(self, hidden_dim):
+    def __init__(self, decoder_hidden_dim, encoder_hidden_dim):
         super(Attention, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.attn = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.v = nn.Linear(hidden_dim, 1, bias=False)
+        self.decoder_hidden_dim = decoder_hidden_dim
+        self.encoder_hidden_dim = encoder_hidden_dim
+        self.attn = nn.Linear(decoder_hidden_dim + encoder_hidden_dim, decoder_hidden_dim)
+        self.v = nn.Linear(decoder_hidden_dim, 1, bias=False)
         
     def forward(self, hidden, encoder_outputs):
         # hidden: (num_layers, batch_size, hidden_dim)
@@ -222,7 +223,7 @@ class Decoder(nn.Module):
     def forward(self, x, hidden, encoder_outputs):
         # x: (batch_size, 1)
         # hidden: (num_layers, batch_size, hidden_dim) or tuple for LSTM
-        # encoder_outputs: (batch_size, src_len, hidden_dim*2)
+        # encoder_outputs: (batch_size, src_len, encoder_hidden_dim*2)
         
         embedded = self.dropout(self.embedding(x))  # (batch_size, 1, embedding_dim)
         
@@ -235,10 +236,10 @@ class Decoder(nn.Module):
         a = a.unsqueeze(1)  # (batch_size, 1, src_len)
         
         # Calculate weighted context vector
-        context = torch.bmm(a, encoder_outputs)  # (batch_size, 1, hidden_dim*2)
+        context = torch.bmm(a, encoder_outputs)  # (batch_size, 1, encoder_hidden_dim*2)
         
         # Concatenate embedded and context
-        rnn_input = torch.cat((embedded, context), dim=2)  # (batch_size, 1, embedding_dim + hidden_dim*2)
+        rnn_input = torch.cat((embedded, context), dim=2)  # (batch_size, 1, embedding_dim + encoder_hidden_dim*2)
         
         if self.cell_type == 'LSTM':
             output, (hidden, cell) = self.rnn(rnn_input, hidden)
@@ -469,7 +470,7 @@ print("="*60)
 encoder = Encoder(len(src_vocab), CONFIG['embedding_dim'], CONFIG['hidden_dim'], 
                  CONFIG['num_layers'], CONFIG['cell_type'], CONFIG['dropout'])
 decoder = Decoder(len(tgt_vocab), CONFIG['embedding_dim'], CONFIG['hidden_dim'], 
-                 CONFIG['num_layers'], CONFIG['cell_type'], CONFIG['dropout'])
+                 CONFIG['hidden_dim'] * 2, CONFIG['num_layers'], CONFIG['cell_type'], CONFIG['dropout'])
 
 model = Seq2SeqWithAttention(encoder, decoder, device).to(device)
 
