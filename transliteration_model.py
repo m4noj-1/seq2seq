@@ -193,7 +193,7 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
     """Improved Decoder with Attention"""
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers=2, 
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, encoder_hidden_dim, num_layers=2, 
                  cell_type='LSTM', dropout=0.3):
         super(Decoder, self).__init__()
         self.hidden_dim = hidden_dim
@@ -205,19 +205,19 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.attention = Attention(hidden_dim)
         
-        # Input to RNN is embedding + context (encoder hidden_dim * 2 for bidirectional)
+        # Input to RNN is embedding + context (encoder outputs are bidirectional: encoder_hidden_dim * 2)
         if cell_type == 'LSTM':
-            self.rnn = nn.LSTM(embedding_dim + hidden_dim * 2, hidden_dim, num_layers, 
+            self.rnn = nn.LSTM(embedding_dim + encoder_hidden_dim, hidden_dim, num_layers, 
                               batch_first=True, dropout=dropout if num_layers > 1 else 0)
         elif cell_type == 'GRU':
-            self.rnn = nn.GRU(embedding_dim + hidden_dim * 2, hidden_dim, num_layers, 
+            self.rnn = nn.GRU(embedding_dim + encoder_hidden_dim, hidden_dim, num_layers, 
                              batch_first=True, dropout=dropout if num_layers > 1 else 0)
         else:  # RNN
-            self.rnn = nn.RNN(embedding_dim + hidden_dim * 2, hidden_dim, num_layers, 
+            self.rnn = nn.RNN(embedding_dim + encoder_hidden_dim, hidden_dim, num_layers, 
                              batch_first=True, dropout=dropout if num_layers > 1 else 0)
         
         # Output layer: hidden + context + embedding -> vocab
-        self.fc = nn.Linear(hidden_dim + hidden_dim * 2 + embedding_dim, vocab_size)
+        self.fc = nn.Linear(hidden_dim + encoder_hidden_dim + embedding_dim, vocab_size)
     
     def forward(self, x, hidden, encoder_outputs):
         # x: (batch_size, 1)
@@ -489,6 +489,7 @@ optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
                                                   factor=0.5, patience=2)
 criterion = nn.CrossEntropyLoss(ignore_index=0)
+print("Scheduler: ReduceLROnPlateau initialized (reduces LR by 0.5 if no improvement for 2 epochs)")
 
 # Training loop
 print("\n" + "="*60)
@@ -580,4 +581,3 @@ print("\n🎯 Expected Improvement: 45-65% word accuracy (was ~29%)")
 print("\n" + "="*60)
 print("DONE! Improved model trained and saved.")
 print("="*60)
-
